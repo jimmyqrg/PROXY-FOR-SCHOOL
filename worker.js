@@ -23,22 +23,17 @@ function isValidUrl(url) {
 function isSpecialUrl(url) {
   if (!url) return true;
   const lower = url.toLowerCase().trim();
-  return lower === '#' || 
-         lower === '' || 
-         lower.startsWith('javascript:') || 
-         lower.startsWith('data:') || 
-         lower.startsWith('blob:') ||
-         lower.startsWith('mailto:') ||
-         lower.startsWith('tel:') ||
-         lower.startsWith('sms:') ||
-         lower.startsWith('about:') ||
-         lower.startsWith('chrome:') ||
-         lower.startsWith('chrome-extension:') ||
-         lower.startsWith('moz-extension:') ||
-         lower.startsWith('file:') ||
-         lower.startsWith('view-source:') ||
-         lower.startsWith('wss:') ||
-         lower.startsWith('ws:');
+  if (lower === '#' || lower === '') return true;
+  // Detect any non-HTTP(S) scheme (RFC 3986: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ))
+  // Only http: and https: should be proxied; everything else is special.
+  const colonIdx = lower.indexOf(':');
+  if (colonIdx > 0 && colonIdx < 20) {
+    const scheme = lower.substring(0, colonIdx);
+    if (/^[a-z][a-z0-9+\-.]*$/.test(scheme) && scheme !== 'http' && scheme !== 'https') {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isAlreadyProxied(url) {
@@ -104,7 +99,9 @@ function rewriteUrl(original, base, isEmbedded = false) {
 function rewriteSrcset(srcset, base, isEmbedded) {
   if (!srcset || typeof srcset !== 'string') return srcset;
   try {
-    return srcset.split(',').map(s => {
+    // Split on comma followed by whitespace to avoid breaking URLs with commas
+    // (e.g. CDN image transformation URLs: /cdn-cgi/image/quality=78,width=314,f=auto/img.png)
+    return srcset.split(/,\s+/).map(s => {
       const parts = s.trim().split(/\s+/);
       if (parts[0] && !isSpecialUrl(parts[0])) {
         parts[0] = rewriteUrl(parts[0], base, isEmbedded);
@@ -662,6 +659,35 @@ var _realLocationHref = _location.href;
 var _realLocationSearch = _location.search;
 var _realLocationPathname = _location.pathname;
 
+// Track the current target URL across pushState/replaceState/popstate.
+// Initialized from the config; updated by our history overrides.
+var _currentTarget = __PROXY_TARGET__;
+
+// _locationProxy will be set to a Proxy wrapping _location later.
+// Until then, it points to the real _location for safety.
+var _locationProxy = _location;
+
+// Bind real location methods BEFORE any overrides touch _location
+var _assign, _replace, _reload;
+try {
+  _assign = _location.assign ? _location.assign.bind(_location) : function(u) { _location.href = u; };
+  _replace = _location.replace ? _location.replace.bind(_location) : function(u) { _location.href = u; };
+  _reload = _location.reload ? _location.reload.bind(_location) : function() {};
+} catch(e) {
+  _assign = function(u) { _location.href = u; };
+  _replace = function(u) { _location.href = u; };
+  _reload = function() {};
+}
+
+// Store REAL parent window BEFORE we override parent/top/frameElement
+// This is critical for postMessage communication with the embedding page
+var _realParent = null;
+try {
+  if (_window.parent && _window.parent !== _window) {
+    _realParent = _window.parent;
+  }
+} catch(e) {}
+
 // ========== SAFE UTILITIES ==========
 function safeStr(v) {
   try {
@@ -672,69 +698,41 @@ function safeStr(v) {
 }
 
 function getCurrentTarget() {
+  // Primary: use the tracked _currentTarget variable (updated by our history overrides)
+  // This is the most reliable method since window.location is unforgeable.
   try {
-    // Read from the REAL location search, not our overridden one
-    // Try multiple methods to get the actual proxy URL's search parameter
+    if (_currentTarget) return _currentTarget;
+  } catch(e) {}
+  
+  // Fallback: try to extract ?url= from the real location search
+  // (works before replaceState rewrites the URL)
+  try {
     var search = '';
     try {
-      // Method 1: Try to access the real location through the prototype
       var realLoc = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
       if (realLoc && realLoc.get) {
-        var realLocation = realLoc.get.call(_window);
-        search = realLocation.search;
+        search = realLoc.get.call(_window).search;
       }
-    } catch(e) {}
+    } catch(e) {
+      search = _realLocationSearch || _location.search;
+    }
     
-    // Method 2: If that failed, try reading from the actual href and parsing
-    if (!search) {
-      try {
-        var currentHref = _location.href;
-        // If href was overridden, try to get it from the actual location
+    if (search) {
+      var params = new URLSearchParams(search);
+      var url = params.get('url');
+      if (url) {
         try {
-          var protoLoc = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
-          if (protoLoc && protoLoc.get) {
-            currentHref = protoLoc.get.call(_window).href;
+          if (url.indexOf('%') !== -1) {
+            var decoded = _decodeURIComponent(url);
+            if (decoded.indexOf('http') === 0) return decoded;
           }
-        } catch(e) {
-          // Fallback: use stored real location href
-          currentHref = _realLocationHref;
-        }
-        var urlObj = new _URL(currentHref);
-        search = urlObj.search;
-      } catch(e) {
-        // Last resort: use stored real search
-        search = _realLocationSearch;
-      }
-    }
-    
-    // Method 3: Update stored values from actual location (for subsequent calls)
-    try {
-      var protoLoc = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
-      if (protoLoc && protoLoc.get) {
-        var realLoc = protoLoc.get.call(_window);
-        _realLocationHref = realLoc.href;
-        _realLocationSearch = realLoc.search;
-        _realLocationPathname = realLoc.pathname;
-        search = realLoc.search;
-      }
-    } catch(e) {}
-    
-    var params = new URLSearchParams(search);
-    var url = params.get('url');
-    if (url) {
-      // Handle double-encoded URLs
-      try {
-        if (url.indexOf('%') !== -1) {
-          var decoded = _decodeURIComponent(url);
-          if (decoded.indexOf('http') === 0) return decoded;
-        }
-      } catch(e) {}
+        } catch(e) {}
         return url;
+      }
     }
-    return __PROXY_TARGET__;
-  } catch(e) {
-    return __PROXY_TARGET__;
-  }
+  } catch(e) {}
+  
+  return __PROXY_TARGET__;
 }
 
 function getCurrentOrigin() {
@@ -756,26 +754,33 @@ function getCurrentHost() {
 function isSpecial(url) {
   if (!url) return true;
   var l = safeStr(url).toLowerCase().trim();
-  // Only skip truly special URLs - be more permissive for relative paths
   if (l === '#' || l === '') return true;
-  if (l.indexOf('javascript:') === 0) return true;
-  if (l.indexOf('data:') === 0) return true;
-  if (l.indexOf('blob:') === 0) return true;
-  if (l.indexOf('mailto:') === 0) return true;
-  if (l.indexOf('tel:') === 0) return true;
-  if (l.indexOf('sms:') === 0) return true;
-  if (l.indexOf('about:') === 0) return true;
-  // WebSocket URLs should be handled differently but not skipped
-  // if (l.indexOf('wss:') === 0 || l.indexOf('ws:') === 0) return true;
+  // Detect any non-HTTP(S) scheme (RFC 3986: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ))
+  // Only http:, https:, ws:, wss: should be proxied; everything else is special.
+  var colonIdx = l.indexOf(':');
+  if (colonIdx > 0 && colonIdx < 20) {
+    var scheme = l.substring(0, colonIdx);
+    if (/^[a-z][a-z0-9+\-.]*$/.test(scheme) && scheme !== 'http' && scheme !== 'https' && scheme !== 'ws' && scheme !== 'wss') {
+      return true;
+    }
+  }
   return false;
 }
 
 function isProxied(url) {
   if (!url) return false;
   var s = safeStr(url);
-  return s.indexOf('/?url=') !== -1 || 
-         s.indexOf('/?embedded=') !== -1 ||
-         s.indexOf('proxy.ikunbeautiful.workers.dev') !== -1;
+  if (s.indexOf('proxy.ikunbeautiful.workers.dev') !== -1) return true;
+  if (s.indexOf('/?url=') !== -1 || s.indexOf('/?embedded=') !== -1) return true;
+  // Also detect path-based format: /path?[...]url=encoded_target
+  try {
+    var testUrl = new _URL(s, 'https://proxy.ikunbeautiful.workers.dev');
+    var urlParam = testUrl.searchParams.get('url');
+    if (urlParam && (urlParam.indexOf('http://') === 0 || urlParam.indexOf('https://') === 0)) {
+      return true;
+    }
+  } catch(e) {}
+  return false;
 }
 
 // ========== MAIN PROXIFY FUNCTION ==========
@@ -855,22 +860,22 @@ _window.__proxyIsSpecial__ = isSpecial;
 _window.__proxyIsProxied__ = isProxied;
 
 // ========== Handle direct window/location assignment ==========
-// Override the setter for window.location
+// Override the setter for window.location to return our Proxy
 try {
   var windowLocationDesc = _Object.getOwnPropertyDescriptor(_window, 'location') ||
                            _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
   if (windowLocationDesc) {
     _Object.defineProperty(_window, 'location', {
-      get: function() { return _location; },
+      get: function() { return _locationProxy; },
       set: function(v) { 
         try { 
           v = safeStr(v);
           if (v && !isSpecial(v) && !isProxied(v)) {
             v = proxify(v);
           }
-          _location.href = v;
+          _assign(v);
         } catch(e) {
-          _location.href = v;
+          try { _assign(v); } catch(e2) { _location.href = v; }
         }
       },
       configurable: true
@@ -879,15 +884,37 @@ try {
 } catch(e) {}
 
 // ========== ANTI-IFRAME-BUSTER (COMPREHENSIVE) ==========
+// Detect if we are a sub-frame within a proxied page.
+// If so, we should NOT override parent/top because the parent is also a
+// proxied page and the page may rely on legitimate parent-child communication
+// (e.g. game iframes communicating with their hosting page).
+var _isSubFrame = false;
 try {
-  _Object.defineProperty(_window, 'top', { get: function() { return _window; }, set: function(){}, configurable: false });
+  if (_realParent && _realParent !== _window) {
+    try {
+      // If the parent also has our proxy injected, it is a proxied sub-frame
+      _isSubFrame = !!_realParent.__proxyProxify__;
+    } catch(e) {
+      // Cross-origin access will throw - parent is not same origin, so it is
+      // either the external browser UI or an external page.  Override.
+      _isSubFrame = false;
+    }
+  }
 } catch(e) {}
-try {
-  _Object.defineProperty(_window, 'parent', { get: function() { return _window; }, set: function(){}, configurable: false });
-} catch(e) {}
-try {
-  _Object.defineProperty(_window, 'frameElement', { get: function() { return null; }, set: function(){}, configurable: false });
-} catch(e) {}
+
+if (!_isSubFrame) {
+  // Top-level proxied frame: override parent/top to prevent iframe-busting
+  try {
+    _Object.defineProperty(_window, 'top', { get: function() { return _window; }, set: function(){}, configurable: false });
+  } catch(e) {}
+  try {
+    _Object.defineProperty(_window, 'parent', { get: function() { return _window; }, set: function(){}, configurable: false });
+  } catch(e) {}
+  try {
+    _Object.defineProperty(_window, 'frameElement', { get: function() { return null; }, set: function(){}, configurable: false });
+  } catch(e) {}
+}
+// Always override self/frames/length for consistency
 try {
   _Object.defineProperty(_window, 'self', { get: function() { return _window; }, set: function(){}, configurable: false });
 } catch(e) {}
@@ -942,183 +969,284 @@ try {
   });
 } catch(e) {}
 
-// ========== LOCATION OBJECT COMPREHENSIVE OVERRIDE ==========
+// ========== LOCATION OBJECT COMPREHENSIVE OVERRIDE (PROXY-BASED) ==========
+// Using a Proxy ensures ALL property reads/writes are intercepted reliably,
+// even for non-configurable properties like pathname, search, hash, etc.
+// Object.defineProperty silently fails for these on Location.prototype in browsers.
 try {
-  var _assign = _location.assign ? _location.assign.bind(_location) : function(u) { _location.href = u; };
-  var _replace = _location.replace ? _location.replace.bind(_location) : function(u) { _location.href = u; };
-  var _reload = _location.reload ? _location.reload.bind(_location) : function() {};
-  
-  _location.assign = function(u) { try { return _assign(proxify(u)); } catch(e) { return _assign(u); } };
-  _location.replace = function(u) { try { return _replace(proxify(u)); } catch(e) { return _replace(u); } };
-  
-  // Override all location properties
-  try {
-    _Object.defineProperty(_location, 'href', {
-      set: function(u) { 
+  if (_Proxy) {
+    _locationProxy = new _Proxy(_location, {
+      get: function(target, prop, receiver) {
         try {
-          var proxied = proxify(u);
-          _assign(proxied);
-          // Update stored real location values after navigation
-          _setTimeout(function() {
+          // URL component properties - return values from the TARGET url
+          if (prop === 'href') return getCurrentTarget();
+          if (prop === 'origin') return getCurrentOrigin();
+          if (prop === 'host') return getCurrentHost();
+          if (prop === 'hostname') {
+            try { return new _URL(getCurrentTarget()).hostname; } catch(e) { return ''; }
+          }
+          if (prop === 'pathname') {
+            try { return new _URL(getCurrentTarget()).pathname; } catch(e) { return '/'; }
+          }
+          if (prop === 'search') {
+            try { return new _URL(getCurrentTarget()).search; } catch(e) { return ''; }
+          }
+          if (prop === 'hash') {
+            try { return new _URL(getCurrentTarget()).hash; } catch(e) { return ''; }
+          }
+          if (prop === 'protocol') {
+            try { return new _URL(getCurrentTarget()).protocol; } catch(e) { return 'https:'; }
+          }
+          if (prop === 'port') {
+            try { return new _URL(getCurrentTarget()).port; } catch(e) { return ''; }
+          }
+          
+          // Navigation methods
+          if (prop === 'assign') {
+            return function(u) { try { return _assign(proxify(u)); } catch(e) { return _assign(u); } };
+          }
+          if (prop === 'replace') {
+            return function(u) { try { return _replace(proxify(u)); } catch(e) { return _replace(u); } };
+          }
+          if (prop === 'reload') {
+            return function(forceReload) { 
+              try { return _reload(forceReload); } catch(e) {} 
+            };
+          }
+          
+          // String coercion
+          if (prop === 'toString') {
+            return function() { return getCurrentTarget(); };
+          }
+          if (prop === 'valueOf') {
+            return function() { return getCurrentTarget(); };
+          }
+          if (prop === 'toJSON') {
+            return function() {
+              try {
+                var u = new _URL(getCurrentTarget());
+                return { href: u.href, origin: u.origin, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash };
+              } catch(e) { return getCurrentTarget(); }
+            };
+          }
+          
+          // Symbol support
+          if (typeof Symbol !== 'undefined') {
+            if (prop === Symbol.toPrimitive) {
+              return function(hint) { return hint === 'number' ? NaN : getCurrentTarget(); };
+            }
             try {
-              var protoLoc = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
-              if (protoLoc && protoLoc.get) {
-                var realLoc = protoLoc.get.call(_window);
-                _realLocationHref = realLoc.href;
-                _realLocationSearch = realLoc.search;
-                _realLocationPathname = realLoc.pathname;
+              if (prop === Symbol.for('nodejs.util.inspect.custom')) {
+                return function() { return getCurrentTarget(); };
               }
             } catch(e) {}
-          }, 0);
+          }
+          
+          // For ancestorOrigins and any other property, return from the real location
+          var val = target[prop];
+          if (typeof val === 'function') return val.bind(target);
+          return val;
         } catch(e) {
-          _assign(u);
+          try { var v = target[prop]; return typeof v === 'function' ? v.bind(target) : v; } catch(e2) { return undefined; }
         }
       },
-      get: function() { return getCurrentTarget(); },
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'origin', {
-      get: function() { return getCurrentOrigin(); },
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'host', {
-      get: function() { return getCurrentHost(); },
-      set: function() {},
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'hostname', {
-      get: function() { 
-        try { return new _URL(getCurrentTarget()).hostname; } 
-        catch(e) { return ''; }
-      },
-      set: function() {},
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'pathname', {
-      get: function() { 
-        try { return new _URL(getCurrentTarget()).pathname; } 
-        catch(e) { return '/'; }
-      },
-      set: function(v) { 
+      set: function(target, prop, value) {
         try {
-          var u = new _URL(getCurrentTarget());
-          u.pathname = v;
-          _assign(proxify(u.href));
-        } catch(e) {}
+          if (prop === 'href') {
+            try {
+              _assign(proxify(safeStr(value)));
+              // Update stored real location values after navigation
+              _setTimeout(function() {
+                try {
+                  var protoLoc = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
+                  if (protoLoc && protoLoc.get) {
+                    var realLoc = protoLoc.get.call(_window);
+                    _realLocationHref = realLoc.href;
+                    _realLocationSearch = realLoc.search;
+                    _realLocationPathname = realLoc.pathname;
+                  }
+                } catch(e) {}
+              }, 0);
+            } catch(e) {
+              _assign(safeStr(value));
+            }
+            return true;
+          }
+          if (prop === 'pathname') {
+            try {
+              var u = new _URL(getCurrentTarget());
+              u.pathname = value;
+              _assign(proxify(u.href));
+            } catch(e) {}
+            return true;
+          }
+          if (prop === 'search') {
+            try {
+              var u = new _URL(getCurrentTarget());
+              u.search = value;
+              _assign(proxify(u.href));
+            } catch(e) {}
+            return true;
+          }
+          if (prop === 'hash') {
+            try {
+              var u = new _URL(getCurrentTarget());
+              u.hash = value;
+              _assign(proxify(u.href));
+            } catch(e) {}
+            return true;
+          }
+          // Silently ignore read-only URL components
+          if (prop === 'host' || prop === 'hostname' || prop === 'protocol' || prop === 'port' || prop === 'origin') {
+            return true;
+          }
+          // For other properties, try to set on real location
+          try { target[prop] = value; } catch(e) {}
+          return true;
+        } catch(e) {
+          return true;
+        }
       },
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'search', {
-      get: function() { 
-        try { return new _URL(getCurrentTarget()).search; } 
-        catch(e) { return ''; }
+      has: function(target, prop) {
+        return prop in target;
       },
-      set: function(v) { 
+      ownKeys: function(target) {
+        return _Object.getOwnPropertyNames(target);
+      },
+      getOwnPropertyDescriptor: function(target, prop) {
         try {
-          var u = new _URL(getCurrentTarget());
-          u.search = v;
-          _assign(proxify(u.href));
-        } catch(e) {}
-      },
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'hash', {
-      get: function() { 
-        try { return new _URL(getCurrentTarget()).hash; } 
-        catch(e) { return ''; }
-      },
-      set: function(v) { 
-        try {
-          var u = new _URL(getCurrentTarget());
-          u.hash = v;
-          _assign(proxify(u.href));
-        } catch(e) {}
-      },
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'protocol', {
-      get: function() { 
-        try { return new _URL(getCurrentTarget()).protocol; } 
-        catch(e) { return 'https:'; }
-      },
-      set: function() {},
-      configurable: true
-    });
-  } catch(e) {}
-  
-  try {
-    _Object.defineProperty(_location, 'port', {
-      get: function() { 
-        try { return new _URL(getCurrentTarget()).port; } 
-        catch(e) { return ''; }
-      },
-      set: function() {},
-      configurable: true
-    });
-  } catch(e) {}
-  
-  // Override toString
-  try {
-    _location.toString = function() { return getCurrentTarget(); };
-  } catch(e) {}
-  
-  // Override valueOf
-  try {
-    _location.valueOf = function() { return getCurrentTarget(); };
-  } catch(e) {}
-  
-  // Override reload to work correctly
-  try {
-    _location.reload = function(forceReload) { 
-      try {
-        return _reload(forceReload);
-      } catch(e) {
-        _window.location = getCurrentTarget();
+          var desc = _Object.getOwnPropertyDescriptor(target, prop);
+          if (desc) desc.configurable = true;
+          return desc;
+        } catch(e) { return undefined; }
       }
-    };
-  } catch(e) {}
-  
-  // Override Symbol.toPrimitive if available
-  try {
-    if (typeof Symbol !== 'undefined' && Symbol.toPrimitive) {
-      _Object.defineProperty(_location, Symbol.toPrimitive, {
-        value: function(hint) {
-          if (hint === 'number') return NaN;
-          return getCurrentTarget();
-        },
-        configurable: true
-      });
-    }
-  } catch(e) {}
-  
+    });
+  } else {
+    // Fallback for environments without Proxy: try defineProperty approach (may silently fail)
+    try { _location.assign = function(u) { try { return _assign(proxify(u)); } catch(e) { return _assign(u); } }; } catch(e) {}
+    try { _location.replace = function(u) { try { return _replace(proxify(u)); } catch(e) { return _replace(u); } }; } catch(e) {}
+    try { _location.toString = function() { return getCurrentTarget(); }; } catch(e) {}
+    try { _location.valueOf = function() { return getCurrentTarget(); }; } catch(e) {}
+  }
 } catch(e) {}
 
-// ========== document.location (same as window.location) ==========
+// Also override methods on the real _location as a belt-and-suspenders approach
+// (these may silently fail but help in some edge cases)
+try { _location.assign = function(u) { try { return _assign(proxify(u)); } catch(e) { return _assign(u); } }; } catch(e) {}
+try { _location.replace = function(u) { try { return _replace(proxify(u)); } catch(e) { return _replace(u); } }; } catch(e) {}
+try { _location.toString = function() { return getCurrentTarget(); }; } catch(e) {}
+try { _location.valueOf = function() { return getCurrentTarget(); }; } catch(e) {}
+
+// ========== Location.prototype property overrides (best-effort) ==========
+// In most browsers, location properties are [LegacyUnforgeable] own properties
+// and cannot be overridden. These overrides are best-effort — they silently fail
+// in Chromium/Firefox but may help in non-standard environments.
+// The REAL fix for location.pathname is replaceState (see bottom of script).
+try {
+  var _LocationProto = _location.constructor && _location.constructor.prototype ? _location.constructor.prototype : null;
+  if (!_LocationProto) {
+    try { _LocationProto = _Object.getPrototypeOf(_location); } catch(e) {}
+  }
+  if (_LocationProto) {
+    // Save original getters/setters for fallback
+    var _origHrefDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'href');
+    var _origPathnameDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'pathname');
+    var _origSearchDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'search');
+    var _origHashDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'hash');
+    var _origHostDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'host');
+    var _origHostnameDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'hostname');
+    var _origOriginDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'origin');
+    var _origProtocolDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'protocol');
+    var _origPortDesc = _Object.getOwnPropertyDescriptor(_LocationProto, 'port');
+
+    try {
+      _Object.defineProperty(_LocationProto, 'href', {
+        get: function() { try { return getCurrentTarget(); } catch(e) { return _origHrefDesc && _origHrefDesc.get ? _origHrefDesc.get.call(this) : ''; } },
+        set: function(v) { try { _assign(proxify(safeStr(v))); } catch(e) { if (_origHrefDesc && _origHrefDesc.set) _origHrefDesc.set.call(this, v); } },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'pathname', {
+        get: function() { try { return new _URL(getCurrentTarget()).pathname; } catch(e) { return _origPathnameDesc && _origPathnameDesc.get ? _origPathnameDesc.get.call(this) : '/'; } },
+        set: function(v) { try { var u = new _URL(getCurrentTarget()); u.pathname = v; _assign(proxify(u.href)); } catch(e) { if (_origPathnameDesc && _origPathnameDesc.set) _origPathnameDesc.set.call(this, v); } },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'search', {
+        get: function() { try { return new _URL(getCurrentTarget()).search; } catch(e) { return _origSearchDesc && _origSearchDesc.get ? _origSearchDesc.get.call(this) : ''; } },
+        set: function(v) { try { var u = new _URL(getCurrentTarget()); u.search = v; _assign(proxify(u.href)); } catch(e) { if (_origSearchDesc && _origSearchDesc.set) _origSearchDesc.set.call(this, v); } },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'hash', {
+        get: function() { try { return new _URL(getCurrentTarget()).hash; } catch(e) { return _origHashDesc && _origHashDesc.get ? _origHashDesc.get.call(this) : ''; } },
+        set: function(v) { try { var u = new _URL(getCurrentTarget()); u.hash = v; _assign(proxify(u.href)); } catch(e) { if (_origHashDesc && _origHashDesc.set) _origHashDesc.set.call(this, v); } },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'host', {
+        get: function() { try { return getCurrentHost(); } catch(e) { return _origHostDesc && _origHostDesc.get ? _origHostDesc.get.call(this) : ''; } },
+        set: function(v) { /* read-only for proxy */ },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'hostname', {
+        get: function() { try { return new _URL(getCurrentTarget()).hostname; } catch(e) { return _origHostnameDesc && _origHostnameDesc.get ? _origHostnameDesc.get.call(this) : ''; } },
+        set: function(v) { /* read-only for proxy */ },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'origin', {
+        get: function() { try { return getCurrentOrigin(); } catch(e) { return _origOriginDesc && _origOriginDesc.get ? _origOriginDesc.get.call(this) : ''; } },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'protocol', {
+        get: function() { try { return new _URL(getCurrentTarget()).protocol; } catch(e) { return _origProtocolDesc && _origProtocolDesc.get ? _origProtocolDesc.get.call(this) : 'https:'; } },
+        set: function(v) { /* read-only for proxy */ },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    try {
+      _Object.defineProperty(_LocationProto, 'port', {
+        get: function() { try { return new _URL(getCurrentTarget()).port; } catch(e) { return _origPortDesc && _origPortDesc.get ? _origPortDesc.get.call(this) : ''; } },
+        set: function(v) { /* read-only for proxy */ },
+        configurable: true, enumerable: true
+      });
+    } catch(e) {}
+
+    // Override toString and valueOf on the prototype too
+    try {
+      _LocationProto.toString = function() { try { return getCurrentTarget(); } catch(e) { return ''; } };
+    } catch(e) {}
+    try {
+      _LocationProto.valueOf = function() { try { return getCurrentTarget(); } catch(e) { return ''; } };
+    } catch(e) {}
+  }
+} catch(e) {}
+
+// ========== document.location (same as window.location, returns Proxy) ==========
 try {
   _Object.defineProperty(_document, 'location', {
-    get: function() { return _location; },
-    set: function(v) { _location.href = v; },
+    get: function() { return _locationProxy; },
+    set: function(v) { 
+      try { _assign(proxify(safeStr(v))); } catch(e) { try { _assign(safeStr(v)); } catch(e2) {} }
+    },
     configurable: true
   });
 } catch(e) {}
@@ -1131,8 +1259,48 @@ try {
   var _back = _history.back ? _history.back.bind(_history) : function(){};
   var _forward = _history.forward ? _history.forward.bind(_history) : function(){};
   
+  // Helper: build proxy URL in format /target/path?[target_search&][embedded=1&]url=encoded_target
+  // The path MUST match the target's path so that location.pathname returns the
+  // correct value (location.pathname is unforgeable in browsers).
+  function buildProxyPath(targetHref) {
+    try {
+      var tUrl = new _URL(targetHref);
+      var parts = [];
+      if (tUrl.search) parts.push(tUrl.search.slice(1));
+      if (__PROXY_EMBEDDED__) parts.push('embedded=1');
+      parts.push('url=' + _encodeURIComponent(targetHref));
+      return tUrl.pathname + '?' + parts.join('&') + (tUrl.hash || '');
+    } catch(e) {
+      return null;
+    }
+  }
+  
   _history.pushState = function(s, t, u) { 
-    try { if (u) u = proxify(u); } catch(e) {}
+    try { 
+      if (u) {
+        var uStr = safeStr(u);
+        // If it's already a proxied URL (has ?url= param), extract the target
+        if (isProxied(uStr)) {
+          try {
+            var pUrl = new _URL(uStr, _realLocationHref);
+            var extracted = pUrl.searchParams.get('url');
+            if (extracted) {
+              _currentTarget = extracted.indexOf('%') !== -1 ? _decodeURIComponent(extracted) : extracted;
+              var built = buildProxyPath(_currentTarget);
+              if (built) u = built;
+            }
+          } catch(e) {}
+        } else {
+          // Resolve relative URL against current target to get new target
+          try {
+            var resolved = new _URL(uStr, _currentTarget).href;
+            _currentTarget = resolved;
+            var built = buildProxyPath(resolved);
+            if (built) u = built;
+          } catch(e) {}
+        }
+      }
+    } catch(e) {}
     try {
       var result = _pushState(s, t, u);
       notifyParent();
@@ -1142,7 +1310,29 @@ try {
     }
   };
   _history.replaceState = function(s, t, u) {
-    try { if (u) u = proxify(u); } catch(e) {}
+    try { 
+      if (u) {
+        var uStr = safeStr(u);
+        if (isProxied(uStr)) {
+          try {
+            var pUrl = new _URL(uStr, _realLocationHref);
+            var extracted = pUrl.searchParams.get('url');
+            if (extracted) {
+              _currentTarget = extracted.indexOf('%') !== -1 ? _decodeURIComponent(extracted) : extracted;
+              var built = buildProxyPath(_currentTarget);
+              if (built) u = built;
+            }
+          } catch(e) {}
+        } else {
+          try {
+            var resolved = new _URL(uStr, _currentTarget).href;
+            _currentTarget = resolved;
+            var built = buildProxyPath(resolved);
+            if (built) u = built;
+          } catch(e) {}
+        }
+      }
+    } catch(e) {}
     try {
       var result = _replaceState(s, t, u);
       notifyParent();
@@ -1168,6 +1358,14 @@ try {
     _setTimeout(notifyParent, 100);
     return result;
   };
+  
+  // CRITICAL: Also override on History.prototype to catch frameworks (e.g. Next.js)
+  // that call History.prototype.pushState.call(history, ...) or cache the native method
+  // before our instance-level override. Without this, the ?url= param gets stripped.
+  try {
+    History.prototype.pushState = _history.pushState;
+    History.prototype.replaceState = _history.replaceState;
+  } catch(e) {}
 } catch(e) {}
 
 // ========== WINDOW.OPEN ==========
@@ -1179,25 +1377,22 @@ try {
       
       var resolved = resolveUrl(url);
       
-      if (__PROXY_EMBEDDED__) {
+      if (__PROXY_EMBEDDED__ && _realParent) {
         try {
-          var realParent = _Object.getPrototypeOf(_window).parent;
-          if (realParent && realParent !== _window) {
-            realParent.postMessage({ type: 'PROXY_NEW_TAB', url: resolved }, '*');
-            // Return a mock window object
+          _realParent.postMessage({ type: 'PROXY_NEW_TAB', url: resolved }, '*');
+          // Return a mock window object
             return {
               closed: false,
               close: function() {
-                realParent.postMessage({ type: 'PROXY_CLOSE_TAB' }, '*');
+              try { _realParent.postMessage({ type: 'PROXY_CLOSE_TAB' }, '*'); } catch(ex) {}
               },
               focus: function() {},
-              blur: function() {},
-              postMessage: function() {},
-              location: { href: resolved }
+            blur: function() {},
+            postMessage: function() {},
+            location: { href: resolved }
             };
-          }
         } catch(e) {}
-        }
+          }
       
       return _open(proxify(url), name, specs);
     } catch(e) {
@@ -1210,13 +1405,10 @@ try {
 try {
   var _close = _window.close ? _window.close.bind(_window) : function(){};
   _window.close = function() {
-    if (__PROXY_EMBEDDED__) {
+    if (__PROXY_EMBEDDED__ && _realParent) {
       try {
-        var realParent = _Object.getPrototypeOf(_window).parent;
-        if (realParent && realParent !== _window) {
-          realParent.postMessage({ type: 'PROXY_CLOSE_TAB' }, '*');
+        _realParent.postMessage({ type: 'PROXY_CLOSE_TAB' }, '*');
           return;
-        }
       } catch(e) {}
       }
       return _close();
@@ -1240,7 +1432,7 @@ try {
       } 
       // Srcset attribute
       else if (n === 'srcset' && value) {
-        value = safeStr(value).split(',').map(function(s) {
+        value = safeStr(value).split(/,\\s+/).map(function(s) {
           var parts = s.trim().split(/\\s+/);
           if (parts[0] && !isSpecial(parts[0]) && !isProxied(parts[0])) {
             parts[0] = proxify(parts[0]);
@@ -1487,7 +1679,7 @@ try {
   var _URLConstructor = _URL;
   _window.URL = function(url, base) {
     // If base is location-like, use the target URL
-    if (base === _location || base === _document.URL || base === _document.baseURI ||
+    if (base === _location || base === _locationProxy || base === _document.URL || base === _document.baseURI ||
         (typeof base === 'string' && base.indexOf('proxy.ikunbeautiful.workers.dev') !== -1)) {
       base = getCurrentTarget();
     }
@@ -1637,10 +1829,40 @@ try {
 try {
   if (_window.WebSocket) {
     var _WebSocket = _window.WebSocket;
+    
+    // Helper: extract the innermost real WebSocket target from a possibly
+    // double/triple-proxied URL like wss://proxy.../ws=wss%3A%2F%2Fproxy.../ws=...
+    function unwrapWsTarget(wsUrl) {
+      for (var i = 0; i < 5; i++) {
+        if (wsUrl.indexOf('proxy.ikunbeautiful.workers.dev') === -1 && wsUrl.indexOf('/?ws=') === -1) break;
+        try {
+          var parse = wsUrl;
+          if (parse.indexOf('ws://') === 0) parse = 'http://' + parse.slice(5);
+          else if (parse.indexOf('wss://') === 0) parse = 'https://' + parse.slice(6);
+          var inner = new _URL(parse).searchParams.get('ws');
+          if (inner) { wsUrl = inner; continue; }
+        } catch(e) {}
+        break;
+      }
+      return wsUrl;
+    }
+    
     _window.WebSocket = function(url, protocols) {
       try {
-        // Resolve relative WebSocket URLs against current target
         var resolvedWsUrl = safeStr(url).trim();
+        
+        // If the URL is already proxied (contains proxy domain or /?ws=),
+        // extract the real target to prevent double-proxying.
+        if (resolvedWsUrl && (resolvedWsUrl.indexOf('/?ws=') !== -1 || resolvedWsUrl.indexOf('proxy.ikunbeautiful.workers.dev') !== -1)) {
+          resolvedWsUrl = unwrapWsTarget(resolvedWsUrl);
+          // If unwrapping yielded a non-proxy URL, fall through to proxy it properly below.
+          // If it's still a proxy URL (couldn't unwrap), pass through directly.
+          if (resolvedWsUrl.indexOf('proxy.ikunbeautiful.workers.dev') !== -1) {
+            if (protocols !== undefined) return new _WebSocket(resolvedWsUrl, protocols);
+            return new _WebSocket(resolvedWsUrl);
+          }
+        }
+        
         if (resolvedWsUrl && !isSpecial(resolvedWsUrl)) {
           // Handle protocol-relative
           if (resolvedWsUrl.indexOf('//') === 0) {
@@ -1649,7 +1871,6 @@ try {
           // Handle relative paths
           if (resolvedWsUrl.indexOf('ws://') !== 0 && resolvedWsUrl.indexOf('wss://') !== 0 &&
               resolvedWsUrl.indexOf('http://') !== 0 && resolvedWsUrl.indexOf('https://') !== 0) {
-            // Resolve against target
             var base = getCurrentTarget();
             try {
               resolvedWsUrl = new _URL(resolvedWsUrl, base).href;
@@ -1662,6 +1883,11 @@ try {
             resolvedWsUrl = 'ws://' + resolvedWsUrl.slice(7);
           } else if (resolvedWsUrl.indexOf('https://') === 0) {
             resolvedWsUrl = 'wss://' + resolvedWsUrl.slice(8);
+          }
+          // Don't proxy WebSocket URLs that already point to our proxy
+          if (resolvedWsUrl.indexOf('proxy.ikunbeautiful.workers.dev') !== -1) {
+            if (protocols !== undefined) return new _WebSocket(resolvedWsUrl, protocols);
+            return new _WebSocket(resolvedWsUrl);
           }
           // Route through proxy WebSocket endpoint
           var proxyWsProtocol = _realLocationHref.indexOf('https://') === 0 ? 'wss://' : 'ws://';
@@ -1752,18 +1978,43 @@ try {
 } catch(e) {}
 
 // ========== Service Worker (BLOCK) ==========
+// Single fake object, resolved ready promise, no unhandled rejections
 try {
   if (navigator && navigator.serviceWorker) {
+    var _fakeActiveWorker = {
+      state: 'activated', scriptURL: '/sw-noop.js',
+      addEventListener: function() {}, removeEventListener: function() {},
+      postMessage: function() {}, onstatechange: null,
+      onerror: null
+    };
+    var _fakeRegistration = { 
+      installing: null, waiting: null, active: _fakeActiveWorker, scope: '/',
+      unregister: function() { return _Promise.resolve(true); },
+      update: function() { return _Promise.resolve(_fakeRegistration); },
+      addEventListener: function() {}, removeEventListener: function() {},
+      onupdatefound: null,
+      navigationPreload: { 
+        enable: function(){ return _Promise.resolve(); }, 
+        disable: function(){ return _Promise.resolve(); }, 
+        setHeaderValue: function(){ return _Promise.resolve(); }, 
+        getState: function(){ return _Promise.resolve({enabled:false,headerValue:''}); } 
+      }
+    };
+    var _fakeSW = {
+      register: function() { return _Promise.resolve(_fakeRegistration); },
+      getRegistration: function() { return _Promise.resolve(_fakeRegistration); },
+      getRegistrations: function() { return _Promise.resolve([_fakeRegistration]); },
+      ready: _Promise.resolve(_fakeRegistration),
+      controller: _fakeActiveWorker,
+      addEventListener: function() {},
+      removeEventListener: function() {},
+      startMessages: function() {},
+      oncontrollerchange: null,
+      onmessage: null,
+      onmessageerror: null
+    };
     _Object.defineProperty(navigator, 'serviceWorker', {
-          get: function() {
-        return {
-          register: function() { return _Promise.reject(new Error('Service Workers disabled in proxy')); },
-          getRegistration: function() { return _Promise.resolve(undefined); },
-          getRegistrations: function() { return _Promise.resolve([]); },
-          ready: _Promise.reject(new Error('Service Workers disabled in proxy')),
-          controller: null
-        };
-      },
+      get: function() { return _fakeSW; },
       configurable: true
     });
   }
@@ -1789,23 +2040,6 @@ try {
         src = proxify(src);
       }
       return src ? new _Audio(src) : new _Audio();
-    };
-    _window.Audio.prototype = _Audio.prototype;
-  }
-} catch(e) {}
-
-// ========== Audio Constructor ==========
-try {
-  var _Audio = _window.Audio;
-  if (_Audio) {
-    _window.Audio = function(src) { 
-      var audio = new _Audio();
-      if (src && !isSpecial(src) && !isProxied(src)) {
-        audio.src = proxify(src);
-      } else if (src) {
-        audio.src = src;
-      }
-      return audio;
     };
     _window.Audio.prototype = _Audio.prototype;
   }
@@ -1865,19 +2099,19 @@ try {
 try {
   var windowProxy = new _Proxy(_window, {
     get: function(target, prop) {
-      if (prop === 'location') return _location;
+      if (prop === 'location') return _locationProxy;
       return target[prop];
     },
     set: function(target, prop, value) {
       if (prop === 'location') {
-        _location.href = safeStr(value);
+        try { _assign(proxify(safeStr(value))); } catch(e) { try { _assign(safeStr(value)); } catch(e2) {} }
         return true;
       }
       target[prop] = value;
       return true;
     }
   });
-  // Can't replace window, but the handler ensures window.location is our patched version
+  // Can't replace window, but the handler ensures window.location is our Proxy version
 } catch(e) {}
 
 // ========== JSON.stringify on location should return target URL ==========
@@ -1907,10 +2141,13 @@ try {
   if (_Object.assign) {
     var _assign_orig = _Object.assign;
     _Object.assign = function(target, ...sources) {
-      // Check if any source is location
+      // Check if any source is location or our location proxy
       var modifiedSources = sources.map(function(src) {
-        if (src === _location) {
-          return _location.toJSON ? _location.toJSON() : { href: getCurrentTarget() };
+        if (src === _location || src === _locationProxy) {
+          try {
+            var u = new _URL(getCurrentTarget());
+            return { href: u.href, origin: u.origin, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash };
+          } catch(e) { return { href: getCurrentTarget() }; }
         }
         return src;
       });
@@ -2226,21 +2463,22 @@ function rewriteCssUrls(css) {
 function rewriteHtml(html) {
   if (!html || typeof html !== 'string') return html;
   try {
-    // List of all URL attributes
-    var urlAttrsPattern = '(src|href|action|data|poster|formaction|background|cite|longdesc|usemap|ping|manifest|icon|codebase)';
-    var dataUrlAttrsPattern = '(data-src|data-href|data-url|data-background|data-poster|data-image|data-thumb|data-full|data-lazy|data-lazy-src|data-original|data-bg|data-video|data-audio|data-link|data-source|data-load)';
+    // List of all URL attributes - use NON-CAPTURING groups (?:...) to avoid
+    // misaligning the callback parameters in .replace()
+    var urlAttrsPattern = '(?:src|href|action|data|poster|formaction|background|cite|longdesc|usemap|ping|manifest|icon|codebase)';
+    var dataUrlAttrsPattern = '(?:data-src|data-href|data-url|data-background|data-poster|data-image|data-thumb|data-full|data-lazy|data-lazy-src|data-original|data-bg|data-video|data-audio|data-link|data-source|data-load)';
     
-    // All URL attributes
+    // All URL attributes - 5 capture groups: pre, attrName, eqQuote, url, closeQuote
     var allUrlPattern = new RegExp('(<[^>]+\\\\s)(' + urlAttrsPattern + '|' + dataUrlAttrsPattern + ')(\\\\s*=\\\\s*["\\x27])([^"\\x27]+)(["\\x27])', 'gi');
-    html = html.replace(allUrlPattern, function(m, pre, attrName, _, attr, url, q) {
+    html = html.replace(allUrlPattern, function(m, pre, attrName, eqQuote, url, closeQuote) {
       if (isSpecial(url) || isProxied(url)) return m;
-      return pre + attrName + attr + proxify(url) + q;
+      return pre + attrName + eqQuote + proxify(url) + closeQuote;
     });
     
     // srcset attributes (complex - need special handling)
     html = html.replace(/(<[^>]+\\s)(srcset\\s*=\\s*["'])([^"']+)(["'])/gi, function(m, pre, attr, srcset, q) {
       try {
-        var newSrcset = srcset.split(',').map(function(s) {
+        var newSrcset = srcset.split(/,\\s+/).map(function(s) {
           var parts = s.trim().split(/\\s+/);
           if (parts[0] && !isSpecial(parts[0]) && !isProxied(parts[0])) {
             parts[0] = proxify(parts[0]);
@@ -2469,7 +2707,7 @@ function processElementUrls(el) {
     if (el.hasAttribute && el.hasAttribute('srcset')) {
       var srcset = el.getAttribute('srcset');
       if (srcset && !isProxied(srcset)) {
-        var newSrcset = srcset.split(',').map(function(s) {
+        var newSrcset = srcset.split(/,\\s+/).map(function(s) {
           var parts = s.trim().split(/\\s+/);
           if (parts[0] && !isSpecial(parts[0]) && !isProxied(parts[0])) {
             parts[0] = proxify(parts[0]);
@@ -2610,7 +2848,7 @@ try {
           var srcset = el.getAttribute('srcset');
           if (srcset && !isProxied(srcset)) {
             try {
-              var newSrcset = srcset.split(',').map(function(s) {
+              var newSrcset = srcset.split(/,\\s+/).map(function(s) {
                 var parts = s.trim().split(/\\s+/);
                 if (parts[0] && !isSpecial(parts[0]) && !isProxied(parts[0])) {
                   parts[0] = proxify(parts[0]);
@@ -2748,28 +2986,14 @@ try {
 
 // ========== Parent Notification ==========
 function notifyParent() {
-  if (!__PROXY_EMBEDDED__) return;
+  if (!__PROXY_EMBEDDED__ || !_realParent) return;
   try {
-    var realParent;
-    try {
-      realParent = _Object.getPrototypeOf(_window).parent;
-    } catch(e) {
-      // Fallback - try to access real parent through iframe
-      try {
-        var frames = _window.frameElement;
-        if (frames && frames.ownerDocument && frames.ownerDocument.defaultView) {
-          realParent = frames.ownerDocument.defaultView;
-        }
-      } catch(e2) {}
-    }
-    if (realParent && realParent !== _window) {
-      realParent.postMessage({
-        type: 'PROXY_URL_CHANGED',
-        url: getCurrentTarget(),
-        title: _document.title,
-        proxyUrl: _location.toString()
+    _realParent.postMessage({
+      type: 'PROXY_URL_CHANGED',
+      url: getCurrentTarget(),
+      title: _document.title,
+      proxyUrl: _realLocationHref
               }, '*');
-            }
   } catch(e) {}
 }
 
@@ -2785,6 +3009,43 @@ try {
     _setTimeout(function() { if (typeof scanAndProxify === 'function') scanAndProxify(); }, 200);
   });
   _window.addEventListener('popstate', function() {
+    // Update _currentTarget from the new URL after popstate
+    try {
+      var realSearch = _location.search;
+      try {
+        var protoLoc = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
+        if (protoLoc && protoLoc.get) {
+          var rl = protoLoc.get.call(_window);
+          realSearch = rl.search;
+        }
+      } catch(e) {}
+      
+      // Check if the URL has ?url= parameter
+      if (realSearch && realSearch.indexOf('url=') !== -1) {
+        var params = new URLSearchParams(realSearch);
+        var urlParam = params.get('url');
+        if (urlParam) {
+          _currentTarget = urlParam.indexOf('%') !== -1 ? _decodeURIComponent(urlParam) : urlParam;
+        }
+      } else {
+        // URL is in target path format (after replaceState)
+        // Reconstruct target from origin + current path
+        var realPath = _location.pathname;
+        var realSearchStr = _location.search;
+        var realHash = _location.hash;
+        try {
+          var protoLoc2 = _Object.getOwnPropertyDescriptor(_Object.getPrototypeOf(_window), 'location');
+          if (protoLoc2 && protoLoc2.get) {
+            var rl2 = protoLoc2.get.call(_window);
+            realPath = rl2.pathname;
+            realSearchStr = rl2.search;
+            realHash = rl2.hash;
+          }
+        } catch(e) {}
+        _currentTarget = __PROXY_ORIGIN__ + realPath + realSearchStr + realHash;
+      }
+    } catch(e) {}
+    
     notifyParent();
     _setTimeout(function() { if (typeof scanAndProxify === 'function') scanAndProxify(); }, 100);
   });
@@ -3042,39 +3303,7 @@ try {
 } catch(e) {}
 
 // ========== Shadow DOM support ==========
-try {
-  var _attachShadow = Element.prototype.attachShadow;
-  if (_attachShadow) {
-    Element.prototype.attachShadow = function(options) {
-      var shadow = _attachShadow.call(this, options);
-      
-      // Watch shadow root for URL changes
-      try {
-        var shadowObserver = new MutationObserver(function(mutations) {
-          mutations.forEach(function(mutation) {
-            if (mutation.type === 'childList') {
-              mutation.addedNodes.forEach(function(node) {
-                if (node.nodeType === 1) {
-                  ['src', 'href', 'action', 'data', 'poster'].forEach(function(attr) {
-                    if (node.hasAttribute && node.hasAttribute(attr)) {
-                      var val = node.getAttribute(attr);
-                      if (val && !isSpecial(val) && !isProxied(val)) {
-                        try { node.setAttribute(attr, proxify(val)); } catch(e) {}
-                      }
-                    }
-                  });
-                }
-              });
-            }
-          });
-        });
-        shadowObserver.observe(shadow, { childList: true, subtree: true });
-      } catch(e) {}
-      
-      return shadow;
-    };
-  }
-} catch(e) {}
+// (Already handled above in the Shadow DOM handling section)
 
 // ========== Template element content ==========
 try {
@@ -3119,7 +3348,7 @@ try {
 
 // ========== Cookie handling - rewrite domain/path ==========
 try {
-  var cookieDesc = _Object.getOwnPropertyDescriptor(_Document.prototype, 'cookie');
+  var cookieDesc = _Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
   if (cookieDesc) {
     var _getCookie = cookieDesc.get;
     var _setCookie = cookieDesc.set;
@@ -3367,10 +3596,10 @@ try {
 } catch(e) {}
 
 // ========== URL concatenation/string coercion ==========
-// Handle things like: "prefix" + location, location + "suffix"
-// This is already handled by toString override, but reinforce it
+// Handled by the location Proxy's get trap for Symbol.toPrimitive and toString.
+// Belt-and-suspenders: also try to set on real _location
 try {
-  if (Symbol && Symbol.for) {
+  if (typeof Symbol !== 'undefined' && Symbol.for) {
     try {
       _Object.defineProperty(_location, Symbol.for('nodejs.util.inspect.custom'), {
         value: function() { return getCurrentTarget(); },
@@ -3525,7 +3754,7 @@ try {
           var srcset = el.getAttribute('srcset');
           if (srcset && !isProxied(srcset)) {
             try {
-              var newSrcset = srcset.split(',').map(function(s) {
+              var newSrcset = srcset.split(/,\\s+/).map(function(s) {
                 var parts = s.trim().split(/\\s+/);
                 if (parts[0] && !isSpecial(parts[0]) && !isProxied(parts[0])) {
                   parts[0] = proxify(parts[0]);
@@ -3629,6 +3858,38 @@ try {
       }
     }, { passive: true });
   });
+} catch(e) {}
+
+// ========== REWRITE URL TO TARGET PATH (preserving ?url= param) ==========
+// This is CRITICAL for client-side routing frameworks (e.g. Next.js).
+// Object.defineProperty on window.location fails (non-configurable in Chrome),
+// ========== REWRITE URL TO TARGET PATH ==========
+// CRITICAL: location.pathname is UNFORGEABLE in browsers — it cannot be
+// overridden via defineProperty on either the instance or the prototype.
+// The ONLY way to make location.pathname return the target's path is to
+// physically change the URL using replaceState.
+//
+// Format: /target/path?[embedded=1&]url=encoded_full_target
+// Example: /en/g/tag?embedded=1&url=https%3A%2F%2Fpoki.com%2Fen%2Fg%2Ftag
+//
+// This ensures:
+// 1. location.pathname returns the target path (for Next.js, React Router, etc.)
+// 2. ?url= parameter is preserved for getCurrentTarget() and Referer-based resolution
+try {
+  var _targetUrlForRewrite = new _URL(__PROXY_TARGET__);
+  var _searchParts = [];
+  // Include target's own search params first
+  if (_targetUrlForRewrite.search) {
+    _searchParts.push(_targetUrlForRewrite.search.slice(1));
+  }
+  if (__PROXY_EMBEDDED__) {
+    _searchParts.push('embedded=1');
+  }
+  _searchParts.push('url=' + _encodeURIComponent(__PROXY_TARGET__));
+  var _newRewriteUrl = _targetUrlForRewrite.pathname + '?' + _searchParts.join('&') + (_targetUrlForRewrite.hash || '');
+  if (_realLocationPathname === '/' || _realLocationSearch.indexOf('url=') !== -1) {
+    _replaceState(_history.state, '', _newRewriteUrl);
+  }
 } catch(e) {}
 
 } catch(globalError) {
@@ -3834,17 +4095,35 @@ function sanitizeHeaders(headers, isEmbedded) {
     }
   }
   
-  // CORS headers for maximum compatibility
+  // CORS headers - set permissive defaults.
+  // NOTE: Access-Control-Allow-Origin will be patched later by fixCorsForRequest()
+  // to echo the actual request Origin when credentials are involved, because
+  // browsers reject wildcard (*) when credentials mode is 'include'.
   newHeaders.set('Access-Control-Allow-Origin', '*');
   newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD');
   newHeaders.set('Access-Control-Allow-Headers', '*');
   newHeaders.set('Access-Control-Expose-Headers', '*');
   newHeaders.set('Access-Control-Allow-Credentials', 'true');
+  // Ensure Referer is always sent (needed for bare-path fallback resolution)
+  newHeaders.set('Referrer-Policy', 'unsafe-url');
   
   // Timing header for performance API
   newHeaders.set('Timing-Allow-Origin', '*');
   
   return newHeaders;
+}
+
+// Patch CORS headers to work with credentialed requests.
+// When the browser sends credentials (cookies, Authorization, etc.),
+// Access-Control-Allow-Origin MUST NOT be '*' — it must echo the
+// actual request Origin. This function patches the headers in-place.
+function fixCorsForRequest(headers, request) {
+  const origin = request.headers.get('Origin');
+  if (origin) {
+    headers.set('Access-Control-Allow-Origin', origin);
+    headers.set('Vary', 'Origin');
+  }
+  return headers;
 }
 
 // --------------------
@@ -3981,83 +4260,118 @@ async function inlineExternalResources(html, baseUrl, isEmbedded) {
   }
   
 // --------------------
-// WebSocket Proxy Handler
+// WebSocket Proxy Handler - NON-BLOCKING
+// Returns 101 immediately so the browser's WebSocket handshake completes
+// instantly. The target connection is established in the background.
+// Messages from the client are queued until the target is connected.
 // --------------------
-async function handleWebSocket(request, targetWsUrl) {
-  // Create a WebSocket pair for the client connection
+function handleWebSocket(request, targetWsUrl) {
   const [client, server] = Object.values(new WebSocketPair());
-  
-  // Accept the server side
   server.accept();
-  
-  try {
-    // Convert ws:// to http:// / wss:// to https:// for the fetch upgrade
-    let fetchUrl = targetWsUrl;
-    if (fetchUrl.startsWith('ws://')) {
-      fetchUrl = 'http://' + fetchUrl.slice(5);
-    } else if (fetchUrl.startsWith('wss://')) {
-      fetchUrl = 'https://' + fetchUrl.slice(6);
+
+  // --- State for background connection ---
+  let targetWs = null;
+  let targetReady = false;
+  let targetFailed = false;
+  const messageQueue = [];   // queued client messages before target is ready
+  let serverClosed = false;
+
+  // Listen for client messages immediately (before target connects)
+  server.addEventListener('message', event => {
+    if (targetReady && targetWs) {
+      try { targetWs.send(event.data); } catch {}
+    } else if (!targetFailed) {
+      messageQueue.push(event.data);
     }
-    
-    // Connect to the target WebSocket server via fetch with Upgrade header
-    const targetResp = await fetch(fetchUrl, {
-      headers: {
-        'Upgrade': 'websocket',
-        'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Origin': new URL(fetchUrl).origin,
-      },
-    });
-    
-    const targetWs = targetResp.webSocket;
-    if (!targetWs) {
-      server.close(1011, 'Failed to connect to target WebSocket');
-      return new Response('WebSocket upgrade to target failed', { status: 502 });
+  });
+
+  server.addEventListener('close', event => {
+    serverClosed = true;
+    if (targetWs) {
+      try { targetWs.close(event.code || 1000, event.reason || ''); } catch {}
     }
-    
-    targetWs.accept();
-    
-    // Relay: client → target
-    server.addEventListener('message', event => {
-      try {
-        targetWs.send(event.data);
-      } catch (e) {
-        try { server.close(1011, 'Relay error to target'); } catch {}
-      }
-    });
-    
-    // Relay: target → client
-    targetWs.addEventListener('message', event => {
-      try {
-        server.send(event.data);
-      } catch (e) {
-        try { targetWs.close(1011, 'Relay error to client'); } catch {}
-      }
-    });
-    
-    // Handle close events
-    server.addEventListener('close', event => {
-      try { targetWs.close(event.code || 1000, event.reason || 'Client closed'); } catch {}
-    });
-    targetWs.addEventListener('close', event => {
-      try { server.close(event.code || 1000, event.reason || 'Target closed'); } catch {}
-    });
-    
-    // Handle errors
-    server.addEventListener('error', () => {
+  });
+
+  server.addEventListener('error', () => {
+    serverClosed = true;
+    if (targetWs) {
       try { targetWs.close(1011, 'Client error'); } catch {}
-    });
-    targetWs.addEventListener('error', () => {
-      try { server.close(1011, 'Target error'); } catch {}
-    });
-    
-  } catch (e) {
-    server.close(1011, 'Connection failed: ' + (e.message || 'Unknown error'));
-    return new Response('WebSocket proxy error: ' + (e.message || 'Unknown error'), { 
-      status: 502,
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
-  }
-  
+    }
+  });
+
+  // --- Connect to target in background (non-blocking) ---
+  (async () => {
+    try {
+      let fetchUrl = targetWsUrl;
+      if (fetchUrl.startsWith('ws://'))  fetchUrl = 'http://'  + fetchUrl.slice(5);
+      else if (fetchUrl.startsWith('wss://')) fetchUrl = 'https://' + fetchUrl.slice(6);
+
+      const wsHeaders = new Headers();
+      wsHeaders.set('Upgrade', 'websocket');
+      wsHeaders.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0');
+      try { wsHeaders.set('Origin', new URL(fetchUrl).origin); } catch {}
+
+      const protocol = request.headers.get('Sec-WebSocket-Protocol');
+      if (protocol) wsHeaders.set('Sec-WebSocket-Protocol', protocol);
+      const extensions = request.headers.get('Sec-WebSocket-Extensions');
+      if (extensions) wsHeaders.set('Sec-WebSocket-Extensions', extensions);
+      const cookie = request.headers.get('Cookie');
+      if (cookie) wsHeaders.set('Cookie', cookie);
+      const auth = request.headers.get('Authorization');
+      if (auth) wsHeaders.set('Authorization', auth);
+
+      const targetResp = await fetch(fetchUrl, { headers: wsHeaders });
+      targetWs = targetResp.webSocket;
+
+      if (!targetWs) {
+        targetFailed = true;
+        if (!serverClosed) {
+          try { server.close(1011, 'Target did not accept WebSocket upgrade'); } catch {}
+        }
+        return;
+      }
+
+      targetWs.accept();
+      targetReady = true;
+
+      // Flush queued messages from client
+      while (messageQueue.length > 0) {
+        try { targetWs.send(messageQueue.shift()); } catch {}
+      }
+
+      // If client already disconnected while we were connecting, close target
+      if (serverClosed) {
+        try { targetWs.close(1000, 'Client already closed'); } catch {}
+        return;
+      }
+
+      // Relay: target → client
+      targetWs.addEventListener('message', event => {
+        if (!serverClosed) {
+          try { server.send(event.data); } catch {}
+        }
+      });
+
+      targetWs.addEventListener('close', event => {
+        if (!serverClosed) {
+          try { server.close(event.code || 1000, event.reason || ''); } catch {}
+        }
+      });
+
+      targetWs.addEventListener('error', () => {
+        if (!serverClosed) {
+          try { server.close(1011, 'Target error'); } catch {}
+        }
+      });
+    } catch (e) {
+      targetFailed = true;
+      if (!serverClosed) {
+        try { server.close(1011, 'Connection failed'); } catch {}
+      }
+    }
+  })();
+
+  // Return 101 IMMEDIATELY - don't wait for the target connection
   return new Response(null, { status: 101, webSocket: client });
 }
   
@@ -4065,37 +4379,69 @@ async function handleWebSocket(request, targetWsUrl) {
   // Main Worker
   // --------------------
   export default {
-    async fetch(request) {
+    async fetch(request, env, ctx) {
       const url = new URL(request.url);
       let target = url.searchParams.get("url");
       const wsTarget = url.searchParams.get("ws");
       let isEmbedded = url.searchParams.get("embedded") === "1";
 
+    // Handle favicon.ico - return empty icon to prevent 404 noise
+    if (url.pathname === '/favicon.ico' && !target && !wsTarget) {
+      return new Response(null, { status: 204, headers: { 'Cache-Control': 'public, max-age=86400' } });
+    }
+
     // CORS preflight
     if (request.method === 'OPTIONS') {
+      const corsOrigin = request.headers.get('Origin') || '*';
       return new Response(null, {
         headers: {
-          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Origin': corsOrigin,
           'Access-Control-Allow-Methods': '*',
           'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400'
+          'Access-Control-Allow-Credentials': 'true',
+          'Access-Control-Max-Age': '86400',
+          ...(corsOrigin !== '*' ? { 'Vary': 'Origin' } : {})
         }
       });
     }
 
     // ========== WebSocket Proxy ==========
     if (wsTarget) {
+      // Unwrap nested proxy WebSocket URLs.
+      // A double-proxied URL looks like:
+      //   ?ws=wss://proxy.ikunbeautiful.workers.dev/?ws=wss%3A%2F%2Freal-target...
+      // We recursively extract the innermost ?ws= target.
+      let finalWsTarget = wsTarget;
+      for (let i = 0; i < 5; i++) { // max 5 unwrap iterations
+        if (finalWsTarget.includes('proxy.ikunbeautiful.workers.dev')) {
+          try {
+            // Normalise ws(s) to http(s) so URL parsing works
+            let parseUrl = finalWsTarget;
+            if (parseUrl.startsWith('ws://')) parseUrl = 'http://' + parseUrl.slice(5);
+            else if (parseUrl.startsWith('wss://')) parseUrl = 'https://' + parseUrl.slice(6);
+            const inner = new URL(parseUrl).searchParams.get('ws');
+            if (inner) {
+              finalWsTarget = inner;
+              continue;
+            }
+          } catch {}
+          break; // Couldn't unwrap further
+        }
+        break; // Not a proxy URL, done
+      }
+
       // Validate WebSocket target
-      if (!wsTarget.startsWith('ws://') && !wsTarget.startsWith('wss://') && 
-          !wsTarget.startsWith('http://') && !wsTarget.startsWith('https://')) {
+      if (!finalWsTarget.startsWith('ws://') && !finalWsTarget.startsWith('wss://') && 
+          !finalWsTarget.startsWith('http://') && !finalWsTarget.startsWith('https://')) {
         return new Response('Invalid WebSocket URL', { status: 400 });
       }
-      if (wsTarget.includes('proxy.ikunbeautiful.workers.dev')) {
+      if (finalWsTarget.includes('proxy.ikunbeautiful.workers.dev')) {
         return new Response('Cannot proxy WebSocket to self', { status: 400 });
       }
-      // Handle WebSocket upgrade
-      if (request.headers.get('Upgrade') === 'websocket') {
-        return handleWebSocket(request, wsTarget);
+      // Handle WebSocket upgrade (case-insensitive check)
+      const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
+      if (upgradeHeader === 'websocket') {
+        return handleWebSocket(request, finalWsTarget);
       }
       // If not a WebSocket upgrade, return error
       return new Response('Expected WebSocket upgrade', { status: 426 });
@@ -4108,12 +4454,13 @@ async function handleWebSocket(request, targetWsUrl) {
     // - lazy loading
     // - CSS url() references
     // - location.href = "page/" if the client-side override fails
+    // - WebSocket upgrades on bare paths
     if (!target) {
       const referer = request.headers.get('Referer') || '';
       let targetBase = '';
       let refEmbedded = false;
 
-      // Method 1: Extract target origin from Referer header
+      // Method 1: Extract target origin from Referer header (?url= parameter)
       try {
         if (referer) {
           const refUrl = new URL(referer);
@@ -4125,7 +4472,9 @@ async function handleWebSocket(request, targetWsUrl) {
         }
       } catch {}
 
-      // Method 2: Cookie fallback (for cases where Referer is missing)
+      // Method 2: Cookie fallback (primary method after replaceState rewrites the URL)
+      // After replaceState changes /?url=... to /target/path, the Referer no longer
+      // has ?url= parameter, so the cookie is the most reliable source.
       if (!targetBase) {
         const cookies = request.headers.get('Cookie') || '';
         const match = cookies.match(/__proxy_target=([^;]+)/);
@@ -4133,10 +4482,32 @@ async function handleWebSocket(request, targetWsUrl) {
           try { targetBase = decodeURIComponent(match[1]); } catch {}
         }
       }
+      
+      // Method 3: Check embedded parameter in Referer even without url param
+      if (targetBase && !refEmbedded) {
+        try {
+          if (referer) {
+            const refUrl = new URL(referer);
+            if (refUrl.searchParams.get('embedded') === '1') {
+              refEmbedded = true;
+            }
+          }
+        } catch {}
+      }
 
       if (targetBase) {
         // Reconstruct the full target URL from the bare path
         const fullTarget = targetBase + url.pathname + url.search;
+
+        // Handle WebSocket upgrades on bare paths
+        const bareUpgrade = (request.headers.get('Upgrade') || '').toLowerCase();
+        if (bareUpgrade === 'websocket') {
+          // Convert to wss:// URL for the WebSocket handler
+          let wsUrl = fullTarget;
+          if (wsUrl.startsWith('http://')) wsUrl = 'ws://' + wsUrl.slice(7);
+          else if (wsUrl.startsWith('https://')) wsUrl = 'wss://' + wsUrl.slice(8);
+          return handleWebSocket(request, wsUrl);
+        }
 
         // For navigation/document requests, REDIRECT so the URL updates properly
         // (this ensures getCurrentTarget() works on the loaded page)
@@ -4175,7 +4546,9 @@ async function handleWebSocket(request, targetWsUrl) {
       requestHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
       requestHeaders.set("Accept", request.headers.get("Accept") || "*/*");
       requestHeaders.set("Accept-Language", request.headers.get("Accept-Language") || "en-US,en;q=0.9");
-      requestHeaders.set("Accept-Encoding", "gzip, deflate, br");
+      // DO NOT set Accept-Encoding explicitly! When it's set, Workers runtime
+      // skips automatic decompression, meaning resp.text() would read raw
+      // compressed bytes as UTF-8 → garbage. Let Workers handle it automatically.
       requestHeaders.set("Referer", target);
       
       // Forward important headers
@@ -4289,11 +4662,14 @@ async function handleWebSocket(request, targetWsUrl) {
           }
           
           const prefix = isEmbedded ? "/?embedded=1&url=" : "/?url=";
+          const redirectCorsOrigin = request.headers.get('Origin') || '*';
           return new Response(null, {
             status: resp.status,
           headers: { 
               'Location': prefix + encodeURIComponent(resolvedLocation),
-              'Access-Control-Allow-Origin': '*'
+              'Access-Control-Allow-Origin': redirectCorsOrigin,
+              'Access-Control-Allow-Credentials': 'true',
+              ...(redirectCorsOrigin !== '*' ? { 'Vary': 'Origin' } : {})
             }
           });
         }
@@ -4301,7 +4677,19 @@ async function handleWebSocket(request, targetWsUrl) {
   
         const contentType = resp.headers.get("content-type") || "";
       const sanitizedHeaders = sanitizeHeaders(resp.headers, isEmbedded);
-  
+      fixCorsForRequest(sanitizedHeaders, request);
+
+      // Helper: strip compression headers for text-processed responses.
+      // Workers' fetch() auto-decompresses when we call resp.text(), so the
+      // body string is uncompressed but the original Content-Encoding header
+      // remains. We must remove it so the browser doesn't try to decompress again.
+      function stripCompressionHeaders(hdrs) {
+        hdrs.delete('content-encoding');
+        hdrs.delete('content-length');
+        hdrs.delete('transfer-encoding');
+        return hdrs;
+      }
+
       // HTML
         if (contentType.includes("text/html")) {
         // Set a cookie with the target origin so bare-path requests can be resolved
@@ -4311,7 +4699,7 @@ async function handleWebSocket(request, targetWsUrl) {
           const targetOrigin = new URL(target).origin;
           sanitizedHeaders.set('Set-Cookie', 
             '__proxy_target=' + encodeURIComponent(targetOrigin) + 
-            '; Path=/; SameSite=Lax; Secure; Max-Age=86400');
+            '; Path=/; SameSite=None; Secure; Max-Age=86400');
         } catch {}
         // Read HTML as text first to inline external resources
         let htmlText = await resp.text();
@@ -4375,6 +4763,8 @@ async function handleWebSocket(request, targetWsUrl) {
         }
         
         // Create a new Response from the inlined HTML and apply rewriter
+        // Strip compression headers since resp.text() already decompressed the body
+        stripCompressionHeaders(sanitizedHeaders);
         return rewriter.transform(new Response(htmlText, {
           status: resp.status,
           statusText: resp.statusText,
@@ -4385,6 +4775,7 @@ async function handleWebSocket(request, targetWsUrl) {
       // CSS
       if (contentType.includes("text/css") || contentType.includes("stylesheet")) {
         const css = await resp.text();
+        stripCompressionHeaders(sanitizedHeaders);
         return new Response(rewriteCSSUrls(css, target, isEmbedded), {
           status: resp.status,
           statusText: resp.statusText,
@@ -4396,6 +4787,7 @@ async function handleWebSocket(request, targetWsUrl) {
       if (contentType.includes("application/json") || contentType.includes("application/manifest+json")) {
         try {
           const json = await resp.text();
+          stripCompressionHeaders(sanitizedHeaders);
           const rewritten = rewriteJsonUrls(json, target, isEmbedded);
           return new Response(rewritten, {
             status: resp.status,
@@ -4416,6 +4808,7 @@ async function handleWebSocket(request, targetWsUrl) {
       if (contentType.includes("image/svg+xml")) {
         try {
           const svg = await resp.text();
+          stripCompressionHeaders(sanitizedHeaders);
           const rewritten = rewriteSvgUrls(svg, target, isEmbedded);
           return new Response(rewritten, {
             status: resp.status,
@@ -4436,6 +4829,7 @@ async function handleWebSocket(request, targetWsUrl) {
           contentType.includes("application/x-javascript") || contentType.includes("text/ecmascript")) {
         try {
           const js = await resp.text();
+          stripCompressionHeaders(sanitizedHeaders);
           const rewritten = rewriteJSUrls(js, target, isEmbedded);
           return new Response(rewritten, {
             status: resp.status,
@@ -4456,6 +4850,7 @@ async function handleWebSocket(request, targetWsUrl) {
           contentType.includes("application/xhtml+xml")) {
         try {
           const xml = await resp.text();
+          stripCompressionHeaders(sanitizedHeaders);
           const rewritten = rewriteSvgUrls(xml, target, isEmbedded); // Reuse SVG rewriter
           return new Response(rewritten, {
             status: resp.status,
