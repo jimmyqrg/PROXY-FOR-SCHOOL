@@ -1,6 +1,6 @@
 // ============================================================
-// ULTRA DEFENSIVE PROXY - MAX FIX VERSION
-// Handles ALL edge cases including WebSockets, Blobs, dynamic imports
+// © JimmyQrg HackWize | For more info check LISENCE
+// Web proxy, unblocker for school
 // ============================================================
 
 // --------------------
@@ -44,6 +44,16 @@ function isAlreadyProxied(url) {
          url.includes('proxy.ikunbeautiful.workers.dev');
 }
 
+// Domains that must NOT be proxied (AWS WAF challenge, etc.) - load/fetch direct
+function isBypassDomainUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const u = new URL(url.trim(), 'https://proxy.ikunbeautiful.workers.dev');
+    const host = (u.hostname || '').toLowerCase();
+    return host === 'awswaf.com' || host.endsWith('.awswaf.com');
+  } catch { return false; }
+}
+
 // --------------------
 // URL Rewriting - ULTRA SAFE
 // --------------------
@@ -84,6 +94,7 @@ function rewriteUrl(original, base, isEmbedded = false) {
     // Don't proxy our own worker or already-proxied URLs
     if (abs.includes("proxy.ikunbeautiful.workers.dev")) return original;
     if (isAlreadyProxied(abs)) return original;
+    if (isBypassDomainUrl(abs)) return original;
   
     // Build proxied URL
     const prefix = isEmbedded ? "/?embedded=1&url=" : "/?url=";
@@ -269,6 +280,7 @@ class ScriptRewriter extends SafeRewriter {
           if (!url || url.includes('proxy.ikunbeautiful.workers.dev') || url.startsWith('data:') || url.startsWith('blob:')) return m;
           if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('/') || url.startsWith('./')) {
             const abs = new URL(url, base).toString();
+            if (isBypassDomainUrl(abs)) return m;
             return `${fn}(${q}${prefix}${encodeURIComponent(abs)}${q}`;
           }
         } catch {}
@@ -783,6 +795,16 @@ function isProxied(url) {
   return false;
 }
 
+// Domains that must NOT be proxied - they require direct browser requests for cookies/auth
+// (e.g. AWS WAF challenge token.awswaf.com - proxying breaks the challenge flow)
+function isBypassDomain(url) {
+  try {
+    var u = new _URL(url, 'https://proxy.ikunbeautiful.workers.dev');
+    var host = (u.hostname || '').toLowerCase();
+    return host === 'awswaf.com' || host.endsWith('.awswaf.com');
+  } catch(e) { return false; }
+}
+
 // ========== MAIN PROXIFY FUNCTION ==========
 function proxify(url, forceEmbedded) {
   try {
@@ -790,6 +812,7 @@ function proxify(url, forceEmbedded) {
     if (!url || url.length === 0 || url.length > 8192) return url;
     if (isSpecial(url)) return url;
     if (isProxied(url)) return url;
+    if (isBypassDomain(url)) return url;
     
     // Protocol-relative
     if (url.indexOf('//') === 0) url = 'https:' + url;
